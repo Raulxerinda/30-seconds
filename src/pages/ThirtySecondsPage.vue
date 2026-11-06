@@ -107,7 +107,9 @@
           </template>
 
           <div class="note">
-            Cada partida dura 30 segundos no total. Cada resposta avança para a pergunta seguinte.
+            Cada turno dura 30 segundos. Durante esse tempo, a equipa responde a várias perguntas.
+            Cada resposta correcta faz o peão avançar uma casa e apresenta uma nova pergunta. A vez
+            só muda quando o tempo termina.
           </div>
 
           <q-btn
@@ -163,11 +165,7 @@
             label="Código da sala"
             hint="Introduz o código de 6 caracteres"
             class="q-mb-md"
-            @update:model-value="
-              roomCodeInput = String($event || '')
-                .toUpperCase()
-                .replace(/[^A-Z0-9]/g, '')
-            "
+            @update:model-value="normalizeRoomCode"
           />
 
           <q-btn
@@ -251,6 +249,19 @@
             {{ selectedMode === 'online' ? 'EQUIPAS ONLINE' : 'PARTIDA' }}
           </q-badge>
         </div>
+
+        <GameBoard
+          :spaces="boardSpaces"
+          :pawn-positions="pawnPositions"
+          :dice-values="diceValues"
+          :phase="gamePhase"
+          :active-team-name="activeTeamLabel"
+          :next-category="nextCategory"
+          :can-roll="canRoll"
+          :can-draw="canDraw"
+          @roll="rollStartDice"
+          @draw="drawCard"
+        />
 
         <div class="timer-panel" :class="{ urgent: timeLeft <= 5 }">
           <div class="timer-caption">TEMPO TOTAL RESTANTE</div>
@@ -346,7 +357,7 @@
 
         <div v-if="currentQuestion" class="question-meta">
           <q-badge color="blue-grey-9">
-            {{ currentQuestion.category || 'Conhecimentos gerais' }}
+            {{ currentQuestionCategory || currentQuestion.category || 'Conhecimentos gerais' }}
           </q-badge>
           <span>Pergunta {{ questionNumber }}</span>
         </div>
@@ -379,7 +390,7 @@
         </div>
 
         <div class="bottom-actions">
-          <span>+100 pontos por resposta correta</span>
+          <span>+100 pontos por resposta correcta · 1 casa por acerto</span>
           <span v-if="selectedMode === 'online'">Sala: {{ roomCode }}</span>
         </div>
       </section>
@@ -458,10 +469,55 @@
 <script setup>
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { Dialog, Notify, copyToClipboard } from 'quasar'
+
 import { authReady, database } from '../boot/firebase'
 import { ref as dbRef, get, set, onValue, runTransaction } from 'firebase/database'
+
 import { questions } from '../data/questions.js'
+import { boardCategories } from '../data/boardCategories.js'
+import GameBoard from '../components/GameBoard.vue'
+
 import { playCorrect, playWrong, playVictory, playTick, playTimeUp } from '../utils/gameAudio.js'
+
+// =====================================================
+// CONFIGURAÇÕES E PERCURSO DO TABULEIRO
+// =====================================================
+
+const TURN_SECONDS = 30
+const TURN_MS = TURN_SECONDS * 1000
+const START_QUESTION_CATEGORY = 'Internacional'
+
+const TRACK_COORDINATES = (() => {
+  const coordinates = []
+
+  // Lado esquerdo: de baixo para cima.
+  for (let row = 11; row >= 1; row--) {
+    coordinates.push({ row, col: 1 })
+  }
+
+  // Parte superior: da esquerda para a direita.
+  for (let col = 2; col <= 11; col++) {
+    coordinates.push({ row: 1, col })
+  }
+
+  // Lado direito: de cima para baixo.
+  for (let row = 2; row <= 11; row++) {
+    coordinates.push({ row, col: 11 })
+  }
+
+  // Parte inferior: da direita para a esquerda.
+  for (let col = 10; col >= 1; col--) {
+    coordinates.push({ row: 11, col })
+  }
+
+  return coordinates.slice(0, boardCategories.length + 2)
+})()
+
+const FINISH_POSITION = boardCategories.length + 1
+
+// =====================================================
+// ESTADO PRINCIPAL
+// =====================================================
 
 const screen = ref('menu')
 const selectedMode = ref('computer')
@@ -491,101 +547,310 @@ const localPlayerNames = ref([
   'Jogador 8',
 ])
 
+// =====================================================
+// ESTADO DA PARTIDA
+// =====================================================
+
+const currentQuestion = ref(null)
+const currentQuestionCategory = ref('')
+
+const activeTeam = ref(0)
+
+const scores = ref([0, 0])
+const onlineScores = ref([0, 0])
+
+const pawnPositions = ref([0, 0])
+const diceValues = ref([0, 0])
+
+const gamePhase = ref('dice')
+
+const timeLeft = ref(TURN_SECONDS)
+const questionNumber = ref(0)
+
+const winnerIndex = ref(-1)
+
+const answerBusy = ref(false)
+const answerMessage = ref('')
+
+// =====================================================
+// ESTADO ONLINE
+// =====================================================
+
 const roomCodeInput = ref('')
 const roomCode = ref('')
 const roomStatus = ref('')
 const roomPlayers = ref([])
+
 const onlineMessage = ref('')
 const onlineLoading = ref(false)
 const roomGameStatus = ref('waiting')
 
-const currentQuestion = ref(null)
-const currentPlayer = ref(0)
-const localTurnIndex = ref(0)
-const scores = ref([0, 0])
-const onlineScores = ref([0, 0])
-const timeLeft = ref(30)
-const questionNumber = ref(1)
-const winnerIndex = ref(-1)
-const answerBusy = ref(false)
-const answerMessage = ref('')
 const myUid = ref('')
 const isRoomHost = ref(false)
+
+const onlineUsedQuestionIds = ref([])
 
 let roomListener = null
 let timerId = null
 let cpuTimeoutId = null
+
 let usedQuestions = []
-let gameStartedAt = 0
-let lastTick = 30
+
+let turnStartedAt = 0
+let lastTick = TURN_SECONDS
+
+let onlineFinishPending = false
 let onlineGameSeen = false
 
-const validQuestions = computed(() =>
-  questions.filter((q) => {
-    const category = String(q.category || q.subject || '')
-    return !/matem[áa]tica/i.test(category)
-  }),
-)
+// =====================================================
+// BANCO DE PERGUNTAS
+// =====================================================
 
-const winnerText = computed(() => {
-  const a = selectedMode.value === 'online' ? onlineScores.value[0] : scores.value[0]
+const validQuestions = computed(() => {
+  return questions.filter((question) => {
+    const category = String(question.category || question.subject || '')
+    const optionsAreValid = Array.isArray(question.options) && question.options.length >= 2
+    const answer = Number(question.answer)
+    const answerIsValid =
+      Number.isInteger(answer) && optionsAreValid && answer >= 0 && answer < question.options.length
 
-  const b = selectedMode.value === 'online' ? onlineScores.value[1] : scores.value[1]
+    return !/matem[áa]tica/i.test(category) && optionsAreValid && answerIsValid
+  })
+})
 
-  if (a === b) return 'Empate!'
+// =====================================================
+// LIGAÇÃO DAS CASAS ÀS CATEGORIAS DAS PERGUNTAS
+// =====================================================
 
+const BOARD_QUESTION_CATEGORIES = {
+  'MZ Challenge': 'Moçambique',
+  'História Nacional': 'Moçambique',
+  GeoMZ: 'Moçambique',
+  'Cultura Viva': 'Moçambique',
+  Personalidades: 'Moçambique',
+
+  'Global Challenge': 'Internacional',
+  'World Atlas': 'Internacional',
+  'World History': 'Internacional',
+  'Africa Zone': 'Internacional',
+
+  'Sports Arena': 'Desporto Africano',
+  'Africa Sports': 'Desporto Africano',
+  'Europe Sports': 'Desporto Europeu',
+  'Football Pro': 'Desporto Europeu',
+  'Game Legends': 'Desporto Europeu',
+
+  'Cartoon World': 'Desenhos Animados',
+  'Anime Zone': 'Desenhos Animados',
+  'Cinema Plus': 'Desenhos Animados',
+  'TV Series': 'Desenhos Animados',
+  'Hero Universe': 'Desenhos Animados',
+  'Music Arena': 'Desenhos Animados',
+
+  'Language Master': 'Internacional',
+  'Literature Club': 'Internacional',
+
+  'Science Lab': 'Ciências',
+  'Human Body': 'Ciências',
+  'Eco Planet': 'Ciências',
+  'Space Explorer': 'Ciências',
+
+  'Tech World': 'Tecnologia',
+  'Innovation Hub': 'Tecnologia',
+  'Digital Life': 'Tecnologia',
+  'Logic Master': 'Ciências',
+  'Brain Power': 'Ciências',
+  'Smart Life': 'Tecnologia',
+
+  'Flag Master': 'Internacional',
+  'Arts & Culture': 'Desenhos Animados',
+  'Puzzle Zone': 'Ciências',
+}
+
+// =====================================================
+// CASAS DO TABULEIRO
+// =====================================================
+
+const boardSpaces = computed(() => {
+  return TRACK_COORDINATES.map((coordinate, index) => {
+    const isStart = index === 0
+    const isFinish = index === FINISH_POSITION
+    const houseName = !isStart && !isFinish ? boardCategories[index - 1] || '' : ''
+
+    const questionCategory = isStart
+      ? START_QUESTION_CATEGORY
+      : isFinish
+        ? ''
+        : BOARD_QUESTION_CATEGORIES[houseName] || START_QUESTION_CATEGORY
+
+    return {
+      index,
+      row: coordinate.row,
+      col: coordinate.col,
+      isStart,
+      isFinish,
+      category: houseName,
+      questionCategory,
+      label: isStart ? 'START' : isFinish ? 'FINISH' : houseName,
+      colorIndex: isStart || isFinish ? 0 : (index - 1) % 4,
+    }
+  })
+})
+
+function questionCategoryForPosition(position) {
+  const numericPosition = Number(position)
+  const safePosition = Number.isInteger(numericPosition)
+    ? Math.min(Math.max(numericPosition, 0), FINISH_POSITION)
+    : 0
+
+  return boardSpaces.value[safePosition]?.questionCategory || START_QUESTION_CATEGORY
+}
+
+const nextCategory = computed(() => {
+  return questionCategoryForPosition(pawnPositions.value[activeTeam.value])
+})
+
+function getQuestionCategory(question, fallback = START_QUESTION_CATEGORY) {
+  return question?.category || question?.subject || fallback
+}
+
+// =====================================================
+// EQUIPAS E TURNOS
+// =====================================================
+
+const playerTeamIndex = computed(() => {
+  const player = roomPlayers.value.find((item) => item.uid === myUid.value)
+  if (!player) return -1
+
+  return Number(player.slot) < roomPlayerCount.value / 2 ? 0 : 1
+})
+
+const activeTeamLabel = computed(() => {
   if (selectedMode.value === 'computer') {
-    return a > b ? `${playerName.value || 'Jogador 1'} venceu!` : 'O computador venceu!'
+    return activeTeam.value === 0 ? 'A TUA VEZ' : 'VEZ DO COMPUTADOR'
   }
 
-  return a > b ? 'A Equipa A venceu!' : 'A Equipa B venceu!'
+  return activeTeam.value === 0 ? 'VEZ DA EQUIPA A' : 'VEZ DA EQUIPA B'
 })
+
+const canRoll = computed(() => {
+  if (gamePhase.value !== 'dice') return false
+  return selectedMode.value !== 'online' || isRoomHost.value
+})
+
+const canDraw = computed(() => {
+  if (gamePhase.value !== 'draw') return false
+  if (selectedMode.value === 'computer') return activeTeam.value === 0
+  if (selectedMode.value === 'online') return playerTeamIndex.value === activeTeam.value
+  return true
+})
+
+const canAnswer = computed(() => {
+  if (gamePhase.value !== 'answer') return false
+  if (selectedMode.value === 'online') return playerTeamIndex.value === activeTeam.value
+  if (selectedMode.value === 'computer') return activeTeam.value === 0
+  return true
+})
+
+// =====================================================
+// RESULTADO
+// =====================================================
+
+const winnerText = computed(() => {
+  if (winnerIndex.value === -1) return 'Empate!'
+
+  if (selectedMode.value === 'computer') {
+    return winnerIndex.value === 0
+      ? `${playerName.value || 'Jogador 1'} venceu!`
+      : 'O computador venceu!'
+  }
+
+  return winnerIndex.value === 0 ? 'A Equipa A venceu!' : 'A Equipa B venceu!'
+})
+
+// =====================================================
+// SELECÇÃO DE PERGUNTAS
+// =====================================================
+
+function selectQuestion(category, alreadyUsed = [], excludedId = null) {
+  if (!validQuestions.value.length) return null
+
+  const requestedCategory = String(category || START_QUESTION_CATEGORY)
+  const categoryQuestions = validQuestions.value.filter((question) => {
+    return (question.category || question.subject || 'Cultura Geral') === requestedCategory
+  })
+
+  // Fallback para o banco completo caso uma categoria não tenha perguntas.
+  const pool = categoryQuestions.length ? categoryQuestions : validQuestions.value
+  const usedIds = new Set(Array.isArray(alreadyUsed) ? alreadyUsed.map(String) : [])
+  const excludedQuestionId =
+    excludedId === null || excludedId === undefined ? null : String(excludedId)
+
+  const unused = pool.filter((question) => {
+    const id = String(question.id)
+    return !usedIds.has(id) && id !== excludedQuestionId
+  })
+
+  const alternatives = pool.filter((question) => {
+    return String(question.id) !== excludedQuestionId
+  })
+
+  const candidates = unused.length ? unused : alternatives.length ? alternatives : pool
+
+  return candidates[Math.floor(Math.random() * candidates.length)] || null
+}
+
+function pickQuestion(category = nextCategory.value, excludedId = null) {
+  const question = selectQuestion(category, usedQuestions, excludedId)
+  if (question) usedQuestions.push(question.id)
+  return question
+}
+
+// =====================================================
+// TEMPORIZADORES
+// =====================================================
 
 function stopTimer() {
   if (timerId) clearInterval(timerId)
   if (cpuTimeoutId) clearTimeout(cpuTimeoutId)
-
   timerId = null
   cpuTimeoutId = null
 }
 
-function pickQuestion() {
-  let pool = validQuestions.value.filter((q) => !usedQuestions.includes(q.id))
-
-  if (!pool.length) {
-    usedQuestions = []
-    pool = [...validQuestions.value]
-  }
-
-  if (!pool.length) return null
-
-  const question = pool[Math.floor(Math.random() * pool.length)]
-  usedQuestions.push(question.id)
-
-  return question
+function startLocalClock() {
+  if (timerId) clearInterval(timerId)
+  turnStartedAt = Date.now()
+  lastTick = TURN_SECONDS
+  timeLeft.value = TURN_SECONDS
+  timerId = setInterval(updateRemaining, 200)
 }
 
 function updateRemaining() {
-  const remaining = Math.max(0, 30 - Math.floor((Date.now() - gameStartedAt) / 1000))
+  if (screen.value !== 'playing' || gamePhase.value !== 'answer') return
 
+  const elapsed = Math.floor((Date.now() - turnStartedAt) / 1000)
+  const remaining = Math.max(0, TURN_SECONDS - elapsed)
   timeLeft.value = remaining
 
   if (remaining !== lastTick) {
     lastTick = remaining
-
-    if (soundEnabled.value && remaining > 0) {
-      playTick(remaining)
-    }
+    if (soundEnabled.value && remaining > 0) playTick(remaining)
   }
 
-  if (remaining <= 0) finishLocalGame()
+  if (remaining <= 0) finishLocalTurn()
 }
 
+// =====================================================
+// INICIAR PARTIDA LOCAL
+// =====================================================
+
 function startLocalGame() {
+  if (selectedMode.value === 'online') return
+
   if (!validQuestions.value.length) {
     Dialog.create({
       title: 'Sem perguntas',
-      message: 'Não existem perguntas disponíveis fora da categoria Matemática.',
+      message: 'Não existem perguntas válidas no banco de dados.',
       ok: 'Entendi',
     })
     return
@@ -594,148 +859,461 @@ function startLocalGame() {
   stopTimer()
 
   scores.value = [0, 0]
-  currentPlayer.value = 0
-  localTurnIndex.value = 0
-  questionNumber.value = 1
-  timeLeft.value = 30
+  pawnPositions.value = [0, 0]
+  diceValues.value = [0, 0]
+  activeTeam.value = 0
+  gamePhase.value = 'dice'
+  questionNumber.value = 0
+  timeLeft.value = TURN_SECONDS
   winnerIndex.value = -1
+  currentQuestion.value = null
+  currentQuestionCategory.value = ''
+  answerBusy.value = false
+  answerMessage.value = ''
+  usedQuestions = []
+  turnStartedAt = 0
+
+  screen.value = 'playing'
+}
+
+// =====================================================
+// LANÇAMENTO DOS DADOS
+// =====================================================
+
+function randomDie() {
+  return Math.floor(Math.random() * 6) + 1
+}
+
+async function rollStartDice() {
+  if (gamePhase.value !== 'dice') return
+
+  const dice = [randomDie(), randomDie()]
+
+  if (selectedMode.value === 'online') {
+    if (!isRoomHost.value || !roomCode.value) return
+
+    try {
+      const winner = dice[0] === dice[1] ? null : dice[0] > dice[1] ? 0 : 1
+      const result = await runTransaction(
+        dbRef(database, `rooms/${roomCode.value}/game`),
+        (game) => {
+          if (!game || game.status !== 'playing' || game.phase !== 'dice') return
+
+          return {
+            ...game,
+            diceValues: dice,
+            activeTeam: winner === null ? game.activeTeam || 0 : winner,
+            phase: winner === null ? 'dice' : 'draw',
+          }
+        },
+      )
+
+      if (result.committed) {
+        if (winner === null) {
+          Notify.create({
+            message: 'Empate nos dados! Lancem novamente.',
+            color: 'warning',
+            icon: 'casino',
+          })
+        } else {
+          Notify.create({
+            message: `A Equipa ${winner === 0 ? 'A' : 'B'} começa!`,
+            color: 'positive',
+            icon: 'flag',
+          })
+        }
+      }
+    } catch (error) {
+      console.error('Erro ao lançar dados online:', error)
+      onlineMessage.value = 'Não foi possível lançar os dados.'
+    }
+    return
+  }
+
+  diceValues.value = dice
+
+  if (dice[0] === dice[1]) {
+    Notify.create({
+      message: 'Empate nos dados! Lança novamente.',
+      color: 'warning',
+      icon: 'casino',
+    })
+    return
+  }
+
+  activeTeam.value = dice[0] > dice[1] ? 0 : 1
+  gamePhase.value = 'draw'
+
+  Notify.create({
+    message: `${activeTeamLabel.value} começa a partida!`,
+    color: 'positive',
+    icon: 'flag',
+  })
+
+  if (selectedMode.value === 'computer' && activeTeam.value === 1) {
+    scheduleCpuDraw()
+  }
+}
+
+// =====================================================
+// RETIRAR CARTA
+// =====================================================
+
+async function drawCard(isComputer = false) {
+  if (gamePhase.value !== 'draw' || screen.value !== 'playing') return
+
+  if (selectedMode.value === 'online') {
+    if (!canDraw.value) return
+    await drawOnlineCard()
+    return
+  }
+
+  if (isComputer) {
+    if (selectedMode.value !== 'computer' || activeTeam.value !== 1) return
+  } else if (!canDraw.value) {
+    return
+  }
+
+  const category = questionCategoryForPosition(pawnPositions.value[activeTeam.value])
+  const question = pickQuestion(category)
+
+  if (!question) {
+    Dialog.create({
+      title: 'Sem perguntas',
+      message: 'Não existem perguntas válidas disponíveis.',
+      ok: 'Entendi',
+    })
+    skipLocalTurnWithoutQuestion()
+    return
+  }
+
+  currentQuestion.value = question
+  currentQuestionCategory.value = getQuestionCategory(question, category)
+  questionNumber.value += 1
   answerMessage.value = ''
   answerBusy.value = false
-  usedQuestions = []
+  gamePhase.value = 'answer'
 
-  currentQuestion.value = pickQuestion()
+  startLocalClock()
 
-  if (!currentQuestion.value) return
-
-  gameStartedAt = Date.now()
-  lastTick = 30
-  screen.value = 'playing'
-
-  timerId = setInterval(updateRemaining, 200)
-
-  if (selectedMode.value === 'computer') {
+  if (selectedMode.value === 'computer' && activeTeam.value === 1) {
     scheduleCpu()
   }
+}
+
+// =====================================================
+// RETIRAR CARTA ONLINE
+// =====================================================
+
+async function drawOnlineCard() {
+  if (!roomCode.value || playerTeamIndex.value !== activeTeam.value) return
+
+  const team = activeTeam.value
+  const position = pawnPositions.value[team]
+  const category = questionCategoryForPosition(position)
+  const question = selectQuestion(category, onlineUsedQuestionIds.value)
+
+  if (!question) {
+    onlineMessage.value = 'Não existem perguntas válidas disponíveis.'
+    return
+  }
+
+  const gameRef = dbRef(database, `rooms/${roomCode.value}/game`)
+
+  try {
+    const result = await runTransaction(gameRef, (game) => {
+      if (
+        !game ||
+        game.status !== 'playing' ||
+        game.phase !== 'draw' ||
+        Number(game.activeTeam) !== team
+      ) {
+        return
+      }
+
+      if (Number(game.pawnPositions?.[team] || 0) !== position) return
+
+      const usedIds = Array.isArray(game.usedQuestionIds) ? game.usedQuestionIds : []
+
+      return {
+        ...game,
+        phase: 'answer',
+        currentQuestion: question,
+        currentQuestionCategory: getQuestionCategory(question, category),
+        questionNumber: (game.questionNumber || 0) + 1,
+        turnStartedAt: Date.now(),
+        timeLeft: TURN_SECONDS,
+        usedQuestionIds: [...usedIds, question.id],
+      }
+    })
+
+    if (!result.committed) {
+      onlineMessage.value = 'A carta já foi retirada ou a vez mudou.'
+    }
+  } catch (error) {
+    console.error(error)
+    onlineMessage.value = 'Erro ao retirar a carta online.'
+  }
+}
+
+// =====================================================
+// COMPUTADOR
+// =====================================================
+
+function scheduleCpuDraw() {
+  if (
+    selectedMode.value !== 'computer' ||
+    activeTeam.value !== 1 ||
+    gamePhase.value !== 'draw' ||
+    screen.value !== 'playing'
+  ) {
+    return
+  }
+
+  if (cpuTimeoutId) clearTimeout(cpuTimeoutId)
+
+  cpuTimeoutId = setTimeout(() => {
+    cpuTimeoutId = null
+
+    if (
+      screen.value !== 'playing' ||
+      selectedMode.value !== 'computer' ||
+      activeTeam.value !== 1 ||
+      gamePhase.value !== 'draw'
+    ) {
+      return
+    }
+
+    drawCard(true)
+  }, 1000)
 }
 
 function scheduleCpu() {
   if (
     selectedMode.value !== 'computer' ||
-    currentPlayer.value !== 1 ||
+    activeTeam.value !== 1 ||
+    gamePhase.value !== 'answer' ||
     screen.value !== 'playing' ||
     timeLeft.value <= 0
-  )
+  ) {
     return
+  }
 
   if (cpuTimeoutId) clearTimeout(cpuTimeoutId)
 
   cpuTimeoutId = setTimeout(
     () => {
-      if (screen.value !== 'playing' || currentPlayer.value !== 1 || !currentQuestion.value) return
+      cpuTimeoutId = null
 
-      const correct = Math.random() < 0.75
+      if (
+        screen.value !== 'playing' ||
+        gamePhase.value !== 'answer' ||
+        activeTeam.value !== 1 ||
+        !currentQuestion.value ||
+        timeLeft.value <= 0
+      ) {
+        return
+      }
+
+      const correct = Math.random() < 0.72
       const correctIndex = Number(currentQuestion.value.answer)
-      const wrongIndex = currentQuestion.value.options.findIndex(
-        (_, index) => index !== correctIndex,
-      )
 
-      submitLocalAnswer(correct ? correctIndex : wrongIndex)
+      const wrongOptions = currentQuestion.value.options
+        .map((_, index) => index)
+        .filter((index) => index !== correctIndex)
+
+      const wrongIndex = wrongOptions.length
+        ? wrongOptions[Math.floor(Math.random() * wrongOptions.length)]
+        : correctIndex
+
+      submitLocalAnswer(correct ? correctIndex : wrongIndex, true)
     },
-    700 + Math.random() * 900,
+    1100 + Math.random() * 900,
   )
 }
 
+// =====================================================
+// RESPONDER
+// =====================================================
+
 function submitAnswer(index) {
-  if (answerBusy.value || !currentQuestion.value || timeLeft.value <= 0) return
+  if (!canAnswer.value || answerBusy.value || !currentQuestion.value || timeLeft.value <= 0) {
+    return
+  }
 
   if (selectedMode.value === 'online') {
     submitOnlineAnswer(index)
-  } else if (selectedMode.value !== 'computer' || currentPlayer.value === 0) {
+  } else {
     submitLocalAnswer(index)
   }
 }
 
-function submitLocalAnswer(index) {
+// =====================================================
+// RESPOSTAS LOCAIS
+// =====================================================
+
+function submitLocalAnswer(index, isComputer = false) {
   if (
-    !currentQuestion.value ||
     screen.value !== 'playing' ||
-    timeLeft.value <= 0 ||
-    answerBusy.value
-  )
+    gamePhase.value !== 'answer' ||
+    !currentQuestion.value ||
+    answerBusy.value ||
+    Date.now() - turnStartedAt >= TURN_MS
+  ) {
     return
+  }
+
+  if (isComputer) {
+    if (selectedMode.value !== 'computer' || activeTeam.value !== 1) return
+  } else if (!canAnswer.value) {
+    return
+  }
 
   answerBusy.value = true
 
   const question = currentQuestion.value
   const correct = Number(index) === Number(question.answer)
-
-  if (correct) {
-    const teamIndex =
-      selectedMode.value === 'computer'
-        ? 0
-        : Math.floor(localTurnIndex.value / (localPlayerCount.value / 2))
-
-    scores.value[teamIndex] += 100
-
-    if (soundEnabled.value) playCorrect()
-    answerMessage.value = 'Resposta correta! +100 pontos'
-  } else {
-    if (soundEnabled.value) playWrong()
-    answerMessage.value = 'Resposta incorreta!'
-  }
+  const team = activeTeam.value
 
   if (cpuTimeoutId) {
     clearTimeout(cpuTimeoutId)
     cpuTimeoutId = null
   }
 
-  if (selectedMode.value === 'duo') {
-    localTurnIndex.value = (localTurnIndex.value + 1) % localPlayerCount.value
+  if (correct) {
+    scores.value[team] += 100
 
-    currentPlayer.value = localTurnIndex.value < localPlayerCount.value / 2 ? 0 : 1
+    const positions = [...pawnPositions.value]
+    positions[team] = Math.min(positions[team] + 1, FINISH_POSITION)
+    pawnPositions.value = positions
+
+    if (soundEnabled.value) playCorrect()
+
+    answerMessage.value = 'Resposta correcta! +100 pontos. Avançaste uma casa.'
+
+    if (positions[team] >= FINISH_POSITION) {
+      answerBusy.value = false
+      finishLocalGame(team)
+      return
+    }
   } else {
-    currentPlayer.value = currentPlayer.value === 0 ? 1 : 0
+    if (soundEnabled.value) playWrong()
+    answerMessage.value = 'Resposta incorrecta! O peão mantém-se. Continua a tentar.'
   }
 
-  currentQuestion.value = pickQuestion()
-  questionNumber.value += 1
-  answerBusy.value = false
+  const category = questionCategoryForPosition(pawnPositions.value[team])
+  const nextQuestion = pickQuestion(category, question.id)
 
-  if (!currentQuestion.value) {
-    finishLocalGame()
+  if (!nextQuestion) {
+    answerBusy.value = false
+    finishLocalTurn()
     return
   }
 
-  if (selectedMode.value === 'computer' && currentPlayer.value === 1) {
+  currentQuestion.value = nextQuestion
+  currentQuestionCategory.value = getQuestionCategory(nextQuestion, category)
+  questionNumber.value += 1
+  answerBusy.value = false
+
+  if (selectedMode.value === 'computer' && activeTeam.value === 1) {
     scheduleCpu()
   }
 }
 
-function finishLocalGame() {
-  if (screen.value !== 'playing' || selectedMode.value === 'online') {
-    return
-  }
+// =====================================================
+// PASSAR TURNO SEM PERGUNTAS
+// =====================================================
+
+function skipLocalTurnWithoutQuestion() {
+  if (screen.value !== 'playing' || gamePhase.value !== 'draw') return
 
   stopTimer()
-  timeLeft.value = 0
 
-  winnerIndex.value =
-    scores.value[0] === scores.value[1] ? -1 : scores.value[0] > scores.value[1] ? 0 : 1
+  currentQuestion.value = null
+  currentQuestionCategory.value = ''
+  answerBusy.value = false
 
-  screen.value = 'result'
+  activeTeam.value = activeTeam.value === 0 ? 1 : 0
+  gamePhase.value = 'draw'
+  timeLeft.value = TURN_SECONDS
+  turnStartedAt = 0
 
-  if (soundEnabled.value && winnerIndex.value !== -1) {
-    playVictory()
+  answerMessage.value = `Não existem perguntas disponíveis. ${activeTeamLabel.value}.`
+
+  if (selectedMode.value === 'computer' && activeTeam.value === 1) {
+    scheduleCpuDraw()
   }
+}
+
+// =====================================================
+// TERMINAR TURNO LOCAL
+// =====================================================
+
+function finishLocalTurn() {
+  if (screen.value !== 'playing' || gamePhase.value !== 'answer') return
+
+  stopTimer()
 
   if (soundEnabled.value) playTimeUp()
+
+  currentQuestion.value = null
+  currentQuestionCategory.value = ''
+  answerBusy.value = false
+
+  activeTeam.value = activeTeam.value === 0 ? 1 : 0
+  gamePhase.value = 'draw'
+  timeLeft.value = TURN_SECONDS
+  turnStartedAt = 0
+
+  answerMessage.value = `${activeTeamLabel.value}. Retirem uma nova carta.`
+
+  if (selectedMode.value === 'computer' && activeTeam.value === 1) {
+    scheduleCpuDraw()
+  }
 }
+
+// =====================================================
+// TERMINAR PARTIDA LOCAL
+// =====================================================
+
+function finishLocalGame(teamIndex) {
+  if (screen.value !== 'playing') return
+
+  stopTimer()
+
+  winnerIndex.value = teamIndex
+  gamePhase.value = 'finished'
+  currentQuestion.value = null
+  currentQuestionCategory.value = ''
+  answerBusy.value = false
+  timeLeft.value = 0
+  screen.value = 'result'
+
+  if (soundEnabled.value) {
+    playVictory()
+    playTimeUp()
+  }
+}
+
+// =====================================================
+// CÓDIGOS DAS SALAS
+// =====================================================
 
 function makeRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-
   return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
 }
+
+function normalizeRoomCode(value) {
+  roomCodeInput.value = String(value || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 6)
+}
+
+// =====================================================
+// CRIAR SALA ONLINE
+// =====================================================
 
 async function createOnlineRoom() {
   if (onlineLoading.value) return
@@ -753,7 +1331,6 @@ async function createOnlineRoom() {
 
     for (let attempt = 0; attempt < 8 && !created; attempt++) {
       code = makeRoomCode()
-
       const roomRef = dbRef(database, `rooms/${code}`)
 
       const result = await runTransaction(roomRef, (currentRoom) => {
@@ -774,9 +1351,17 @@ async function createOnlineRoom() {
           },
           game: {
             status: 'waiting',
+            phase: 'waiting',
+            activeTeam: 0,
             scores: [0, 0],
+            pawnPositions: [0, 0],
+            diceValues: [0, 0],
             questionNumber: 0,
-            timeLeft: 30,
+            usedQuestionIds: [],
+            currentQuestion: null,
+            currentQuestionCategory: '',
+            timeLeft: TURN_SECONDS,
+            turnStartedAt: 0,
           },
         }
       })
@@ -791,6 +1376,7 @@ async function createOnlineRoom() {
     roomCode.value = code
     roomCodeInput.value = code
     isRoomHost.value = true
+    selectedMode.value = 'online'
 
     listenToRoom(code)
   } catch (error) {
@@ -800,6 +1386,10 @@ async function createOnlineRoom() {
     onlineLoading.value = false
   }
 }
+
+// =====================================================
+// ENTRAR NUMA SALA ONLINE
+// =====================================================
 
 async function joinOnlineRoom() {
   if (onlineLoading.value) return
@@ -846,15 +1436,11 @@ async function joinOnlineRoom() {
         dbRef(database, `rooms/${code}/players`),
         (currentPlayers) => {
           const updated = { ...(currentPlayers || {}) }
-
           if (updated[user.uid]) return updated
+          if (Object.keys(updated).length >= limit) return
 
-          const currentCount = Object.keys(updated).length
-          if (currentCount >= limit) return
-
-          const slots = Object.values(updated).map((p) => Number(p.slot))
+          const slots = Object.values(updated).map((player) => Number(player.slot))
           let slot = 0
-
           while (slots.includes(slot)) slot++
 
           updated[user.uid] = {
@@ -877,6 +1463,7 @@ async function joinOnlineRoom() {
     roomCode.value = code
     roomPlayerCount.value = limit
     isRoomHost.value = room.hostId === user.uid
+    selectedMode.value = 'online'
 
     listenToRoom(code)
   } catch (error) {
@@ -888,8 +1475,13 @@ async function joinOnlineRoom() {
   }
 }
 
+// =====================================================
+// SINCRONIZAR SALA ONLINE
+// =====================================================
+
 function listenToRoom(code) {
   if (roomListener) roomListener()
+  stopTimer()
 
   roomListener = onValue(
     dbRef(database, `rooms/${code}`),
@@ -901,9 +1493,9 @@ function listenToRoom(code) {
 
       const room = snapshot.val()
       const limit = Number(room.playerLimit) || 4
+      const game = room.game || {}
 
       roomPlayerCount.value = limit
-
       roomPlayers.value = Object.values(room.players || {}).sort(
         (a, b) => Number(a.slot) - Number(b.slot),
       )
@@ -914,37 +1506,54 @@ function listenToRoom(code) {
           ? 'À espera dos restantes jogadores.'
           : 'As equipas estão completas.')
 
-      roomGameStatus.value = room.game?.status || 'waiting'
-      onlineScores.value = room.game?.scores || [0, 0]
+      roomGameStatus.value = game.status || 'waiting'
+      onlineScores.value = game.scores || [0, 0]
 
-      if (room.game?.status === 'playing') {
+      if (game.status === 'playing') {
         selectedMode.value = 'online'
-        currentQuestion.value = room.game.currentQuestion || null
-        questionNumber.value = room.game.questionNumber || 1
-        gameStartedAt = room.game.startedAt || gameStartedAt
+        screen.value = 'playing'
+        gamePhase.value = game.phase || 'dice'
+        activeTeam.value = Number(game.activeTeam) || 0
+        pawnPositions.value = game.pawnPositions || [0, 0]
+        diceValues.value = game.diceValues || [0, 0]
+        currentQuestion.value = game.currentQuestion || null
+        currentQuestionCategory.value = game.currentQuestionCategory || ''
+        questionNumber.value = game.questionNumber || 0
+        onlineUsedQuestionIds.value = game.usedQuestionIds || []
 
-        timeLeft.value = Math.max(0, 30 - Math.floor((Date.now() - gameStartedAt) / 1000))
-
-        if (screen.value !== 'playing') {
-          screen.value = 'playing'
+        if (game.phase === 'answer') {
+          turnStartedAt = Number(game.turnStartedAt) || Date.now()
+          const elapsed = Math.floor((Date.now() - turnStartedAt) / 1000)
+          timeLeft.value = Math.max(0, TURN_SECONDS - elapsed)
           startOnlineClock()
+        } else {
+          stopTimer()
+          timeLeft.value = TURN_SECONDS
+          turnStartedAt = 0
         }
-      } else if (room.game?.status === 'finished') {
+      } else if (game.status === 'finished') {
         stopTimer()
-
-        onlineScores.value = room.game.scores || [0, 0]
-        timeLeft.value = 0
+        selectedMode.value = 'online'
+        screen.value = 'result'
+        gamePhase.value = 'finished'
+        onlineScores.value = game.scores || [0, 0]
+        pawnPositions.value = game.pawnPositions || [0, 0]
 
         winnerIndex.value =
-          onlineScores.value[0] === onlineScores.value[1]
-            ? -1
-            : onlineScores.value[0] > onlineScores.value[1]
-              ? 0
-              : 1
+          typeof game.winnerTeam === 'number'
+            ? game.winnerTeam
+            : onlineScores.value[0] === onlineScores.value[1]
+              ? -1
+              : onlineScores.value[0] > onlineScores.value[1]
+                ? 0
+                : 1
 
-        screen.value = 'result'
+        timeLeft.value = 0
 
-        if (soundEnabled.value && !onlineGameSeen) playVictory()
+        if (soundEnabled.value && !onlineGameSeen) {
+          playVictory()
+          playTimeUp()
+        }
 
         onlineGameSeen = true
       }
@@ -955,6 +1564,10 @@ function listenToRoom(code) {
     },
   )
 }
+
+// =====================================================
+// INICIAR PARTIDA ONLINE
+// =====================================================
 
 async function startOnlineGame() {
   if (!isRoomHost.value || roomPlayers.value.length !== roomPlayerCount.value) {
@@ -968,139 +1581,191 @@ async function startOnlineGame() {
   }
 
   try {
-    usedQuestions = []
-
-    const firstQuestion = pickQuestion()
-
-    if (!firstQuestion) {
-      onlineMessage.value = 'Não foi possível obter uma pergunta.'
-      return
-    }
-
-    const startedAt = Date.now()
+    onlineGameSeen = false
+    onlineUsedQuestionIds.value = []
 
     await set(dbRef(database, `rooms/${roomCode.value}/game`), {
       status: 'playing',
-      startedAt,
+      phase: 'dice',
+      activeTeam: 0,
       scores: [0, 0],
-      questionNumber: 1,
-      currentQuestion: firstQuestion,
-      answeredQuestion: 0,
-      timeLeft: 30,
+      pawnPositions: [0, 0],
+      diceValues: [0, 0],
+      questionNumber: 0,
+      usedQuestionIds: [],
+      currentQuestion: null,
+      currentQuestionCategory: '',
+      timeLeft: TURN_SECONDS,
+      turnStartedAt: 0,
+      startedAt: Date.now(),
     })
-
-    onlineGameSeen = false
   } catch (error) {
     console.error(error)
     onlineMessage.value = 'Não foi possível iniciar. Verifica as regras do Firebase.'
   }
 }
 
+// =====================================================
+// RELÓGIO ONLINE
+// =====================================================
+
 function startOnlineClock() {
-  if (timerId) return
+  if (timerId || !roomCode.value) return
 
   lastTick = timeLeft.value
 
-  timerId = setInterval(async () => {
-    if (screen.value !== 'playing' || selectedMode.value !== 'online' || !roomCode.value) {
+  timerId = setInterval(() => {
+    if (
+      screen.value !== 'playing' ||
+      selectedMode.value !== 'online' ||
+      gamePhase.value !== 'answer'
+    ) {
       stopTimer()
       return
     }
 
-    const elapsed = Math.floor((Date.now() - gameStartedAt) / 1000)
-    const remaining = Math.max(0, 30 - elapsed)
-
+    const elapsed = Math.floor((Date.now() - turnStartedAt) / 1000)
+    const remaining = Math.max(0, TURN_SECONDS - elapsed)
     timeLeft.value = remaining
 
     if (remaining !== lastTick) {
       lastTick = remaining
-
-      if (soundEnabled.value && remaining > 0) {
-        playTick(remaining)
-      }
+      if (soundEnabled.value && remaining > 0) playTick(remaining)
     }
 
-    if (remaining <= 0 && isRoomHost.value) {
-      try {
-        await runTransaction(dbRef(database, `rooms/${roomCode.value}/game`), (game) => {
-          if (!game || game.status !== 'playing') return game
-
-          return {
-            ...game,
-            status: 'finished',
-            timeLeft: 0,
-            finishedAt: Date.now(),
-          }
-        })
-      } catch (error) {
-        console.error(error)
-      }
-    }
+    if (remaining <= 0) finishOnlineTurn()
   }, 200)
 }
 
+// =====================================================
+// TERMINAR TURNO ONLINE
+// =====================================================
+
+async function finishOnlineTurn() {
+  if (onlineFinishPending || !roomCode.value) return
+
+  onlineFinishPending = true
+
+  try {
+    await runTransaction(dbRef(database, `rooms/${roomCode.value}/game`), (game) => {
+      if (!game || game.status !== 'playing' || game.phase !== 'answer') return
+
+      const elapsed = Date.now() - Number(game.turnStartedAt || 0)
+      if (elapsed < TURN_MS) return
+
+      return {
+        ...game,
+        phase: 'draw',
+        activeTeam: Number(game.activeTeam) === 0 ? 1 : 0,
+        currentQuestion: null,
+        currentQuestionCategory: '',
+        timeLeft: TURN_SECONDS,
+        turnStartedAt: 0,
+      }
+    })
+  } catch (error) {
+    console.error(error)
+    onlineMessage.value = 'Erro ao mudar o turno online.'
+  } finally {
+    onlineFinishPending = false
+  }
+}
+
+// =====================================================
+// RESPOSTAS ONLINE
+// =====================================================
+
 async function submitOnlineAnswer(index) {
-  if (!roomCode.value || !currentQuestion.value || answerBusy.value || timeLeft.value <= 0) return
+  if (
+    !roomCode.value ||
+    !currentQuestion.value ||
+    answerBusy.value ||
+    timeLeft.value <= 0 ||
+    playerTeamIndex.value !== activeTeam.value ||
+    gamePhase.value !== 'answer' ||
+    Date.now() - turnStartedAt >= TURN_MS
+  ) {
+    return
+  }
 
   answerBusy.value = true
 
   try {
-    const gameRef = dbRef(database, `rooms/${roomCode.value}/game`)
     const question = currentQuestion.value
     const questionId = question.id
     const correct = Number(index) === Number(question.answer)
-    const player = roomPlayers.value.find((p) => p.uid === myUid.value)
+    const team = activeTeam.value
+    const currentPosition = Number(pawnPositions.value[team]) || 0
 
-    if (!player) {
-      onlineMessage.value = 'Não foi possível identificar o teu jogador.'
-      return
+    const newPosition = correct ? Math.min(currentPosition + 1, FINISH_POSITION) : currentPosition
+
+    const reachedFinish = correct && newPosition >= FINISH_POSITION
+    const category = questionCategoryForPosition(newPosition)
+
+    const nextQuestion = reachedFinish
+      ? null
+      : selectQuestion(category, onlineUsedQuestionIds.value, questionId)
+
+    if (!reachedFinish && !nextQuestion) {
+      throw new Error('Não existem perguntas válidas disponíveis.')
     }
 
-    const playerLimit = Number(roomPlayerCount.value) || 2
-
-    // Cada metade da sala pertence a uma equipa.
-    const teamIndex = Number(player.slot) < playerLimit / 2 ? 0 : 1
-
-    // Escolher fora da transação evita alterar usedQuestions
-    // quando o Firebase repete a função de atualização.
-    const nextQuestion = pickQuestion()
+    const gameRef = dbRef(database, `rooms/${roomCode.value}/game`)
 
     const result = await runTransaction(gameRef, (game) => {
-      if (!game || game.status !== 'playing' || game.currentQuestion?.id !== questionId) return
-
-      if (Date.now() - game.startedAt >= 30000) {
-        return {
-          ...game,
-          status: 'finished',
-          timeLeft: 0,
-          finishedAt: Date.now(),
-        }
+      if (
+        !game ||
+        game.status !== 'playing' ||
+        game.phase !== 'answer' ||
+        game.currentQuestion?.id !== questionId ||
+        Number(game.activeTeam) !== team
+      ) {
+        return
       }
 
-      const updatedScores = Array.isArray(game.scores) ? [...game.scores] : [0, 0]
+      const startedAt = Number(game.turnStartedAt || 0)
+      if (Date.now() - startedAt >= TURN_MS) return
+
+      const positions = [...(game.pawnPositions || [0, 0])]
+      if (Number(positions[team] || 0) !== currentPosition) return
+
+      const updatedScores = [...(game.scores || [0, 0])]
 
       if (correct) {
-        updatedScores[teamIndex] = (updatedScores[teamIndex] || 0) + 100
+        updatedScores[team] = (updatedScores[team] || 0) + 100
+        positions[team] = newPosition
       }
 
-      if (!nextQuestion) {
+      const baseState = {
+        ...game,
+        scores: updatedScores,
+        pawnPositions: positions,
+        answeredBy: myUid.value,
+        lastAnswerCorrect: correct,
+        lastAnswerAt: Date.now(),
+      }
+
+      if (reachedFinish) {
         return {
-          ...game,
+          ...baseState,
           status: 'finished',
-          scores: updatedScores,
+          phase: 'finished',
+          winnerTeam: team,
           timeLeft: 0,
           finishedAt: Date.now(),
+          currentQuestion: null,
+          currentQuestionCategory: '',
         }
       }
 
+      const usedIds = Array.isArray(game.usedQuestionIds) ? game.usedQuestionIds : []
+
       return {
-        ...game,
-        scores: updatedScores,
+        ...baseState,
         currentQuestion: nextQuestion,
-        questionNumber: (game.questionNumber || 1) + 1,
-        answeredQuestion: (game.answeredQuestion || 0) + 1,
-        lastAnsweredBy: myUid.value,
-        lastAnswerCorrect: correct,
+        currentQuestionCategory: getQuestionCategory(nextQuestion, category),
+        questionNumber: (game.questionNumber || 0) + 1,
+        usedQuestionIds: [...usedIds, nextQuestion.id],
       }
     })
 
@@ -1110,44 +1775,44 @@ async function submitOnlineAnswer(index) {
         else playWrong()
       }
 
-      answerMessage.value = correct ? 'Resposta correta!' : 'Resposta incorreta!'
+      answerMessage.value = correct
+        ? 'Resposta correcta! +100 pontos. Avançaste uma casa.'
+        : 'Resposta incorrecta! O peão mantém-se. Continua a tentar.'
     } else {
-      answerMessage.value = 'Outro jogador já respondeu a esta pergunta.'
+      answerMessage.value = 'A resposta já foi processada ou o tempo terminou.'
     }
   } catch (error) {
     console.error(error)
-    onlineMessage.value = 'A resposta não foi sincronizada. Tenta novamente.'
+    onlineMessage.value = error?.message || 'A resposta não foi sincronizada. Tenta novamente.'
   } finally {
     answerBusy.value = false
   }
 }
 
+// =====================================================
+// COPIAR CÓDIGO DA SALA
+// =====================================================
+
 async function copyRoomCode() {
   try {
     await copyToClipboard(roomCode.value)
-
-    Notify.create({
-      type: 'positive',
-      message: 'Código copiado!',
-    })
+    Notify.create({ type: 'positive', message: 'Código copiado!' })
   } catch {
     onlineMessage.value = `Partilha este código: ${roomCode.value}`
   }
 }
+
+// =====================================================
+// SAIR DA PARTIDA
+// =====================================================
 
 function confirmExit() {
   Dialog.create({
     title: 'Sair da partida?',
     message: 'Queres voltar ao menu?',
     persistent: true,
-    ok: {
-      label: 'Sair',
-      color: 'negative',
-    },
-    cancel: {
-      label: 'Continuar',
-      flat: true,
-    },
+    ok: { label: 'Sair', color: 'negative' },
+    cancel: { label: 'Continuar', flat: true },
   }).onOk(backToMenu)
 }
 
@@ -1161,21 +1826,41 @@ function backToMenu() {
 
   screen.value = 'menu'
   currentQuestion.value = null
+  currentQuestionCategory.value = ''
   answerBusy.value = false
   answerMessage.value = ''
+
   roomCode.value = ''
   roomCodeInput.value = ''
   roomPlayers.value = []
   roomStatus.value = ''
   onlineMessage.value = ''
   roomGameStatus.value = 'waiting'
+
   onlineScores.value = [0, 0]
+  scores.value = [0, 0]
+  pawnPositions.value = [0, 0]
+  diceValues.value = [0, 0]
+
   selectedMode.value = 'computer'
+  activeTeam.value = 0
+  gamePhase.value = 'dice'
   isRoomHost.value = false
   myUid.value = ''
-  timeLeft.value = 30
+
+  timeLeft.value = TURN_SECONDS
+  questionNumber.value = 0
   winnerIndex.value = -1
+
+  onlineUsedQuestionIds.value = []
+  usedQuestions = []
+  turnStartedAt = 0
+  onlineFinishPending = false
 }
+
+// =====================================================
+// LIMPEZA AO SAIR DA PÁGINA
+// =====================================================
 
 onBeforeUnmount(() => {
   stopTimer()
@@ -1190,11 +1875,8 @@ onBeforeUnmount(() => {
 <style scoped>
 /* =====================================================
    30 SEGUNDOS — TEMA PREMIUM
-   Paleta inspirada na capa do jogo
    Azul profundo • Azul eléctrico • Dourado • Laranja
 ===================================================== */
-
-/* 1. PÁGINA E FUNDO */
 
 .game-page {
   position: relative;
@@ -1202,13 +1884,11 @@ onBeforeUnmount(() => {
   min-height: 100vh;
   color: #f8faff;
   background-color: #050d27;
-
   background-image:
     radial-gradient(ellipse at 50% 0%, rgba(0, 119, 255, 0.2), transparent 55%),
     radial-gradient(ellipse at 100% 50%, rgba(255, 133, 25, 0.09), transparent 42%),
     linear-gradient(180deg, rgba(4, 12, 37, 0.22), rgba(4, 9, 29, 0.62)),
     url('/capa-30-segundos.png');
-
   background-size: auto, auto, auto, cover;
   background-position:
     center,
@@ -1225,8 +1905,6 @@ onBeforeUnmount(() => {
   margin: 0 auto;
   padding: 0 18px;
 }
-
-/* 2. CABEÇALHO E IDENTIDADE DO JOGO */
 
 .game-header,
 .brand,
@@ -1258,11 +1936,8 @@ onBeforeUnmount(() => {
   height: 58px;
   border: 2px solid rgba(255, 216, 91, 0.8);
   border-radius: 17px;
-
   background: linear-gradient(145deg, #ffca28, #ff7a18 65%, #e84b12);
-
   color: #07112d;
-
   box-shadow:
     0 0 18px rgba(255, 174, 40, 0.35),
     inset 0 1px 0 rgba(255, 255, 255, 0.55);
@@ -1280,14 +1955,11 @@ onBeforeUnmount(() => {
   color: #b9dcff;
   font-size: 12px;
 }
-
 .player-info span,
 .result-subtitle {
   color: #bad5f5;
   font-size: 12px;
 }
-
-/* 3. TÍTULO E INTRODUÇÃO */
 
 .hero {
   max-width: 650px;
@@ -1308,7 +1980,6 @@ onBeforeUnmount(() => {
   color: #ffd34f;
   text-shadow: 0 0 24px rgba(255, 178, 24, 0.3);
 }
-
 .hero p {
   max-width: 520px;
   color: #d7e7ff;
@@ -1324,8 +1995,6 @@ onBeforeUnmount(() => {
   letter-spacing: 2px;
 }
 
-/* 4. CARTÕES DOS MODOS DE JOGO */
-
 .mode-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1339,24 +2008,18 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   gap: 12px;
   overflow: hidden;
-
   min-width: 0;
   min-height: 160px;
   padding: 22px;
-
   border: 1px solid rgba(77, 167, 255, 0.45);
   border-radius: 19px;
-
   background: linear-gradient(145deg, rgba(13, 47, 100, 0.93), rgba(7, 20, 54, 0.95));
-
   color: #fff;
   text-align: left;
   cursor: pointer;
-
   box-shadow:
     0 12px 35px rgba(0, 0, 0, 0.28),
     inset 0 1px 0 rgba(255, 255, 255, 0.08);
-
   transition:
     transform 0.25s ease,
     border-color 0.25s ease,
@@ -1367,14 +2030,11 @@ onBeforeUnmount(() => {
 .mode-card:hover,
 .mode-card.chosen {
   border-color: #ffd34f;
-
   background: linear-gradient(145deg, rgba(28, 81, 155, 0.97), rgba(20, 32, 78, 0.97));
-
   box-shadow:
     0 0 0 1px rgba(255, 211, 79, 0.13),
     0 0 26px rgba(34, 145, 255, 0.23),
     0 14px 32px rgba(0, 0, 0, 0.27);
-
   transform: translateY(-3px);
 }
 
@@ -1383,29 +2043,22 @@ onBeforeUnmount(() => {
   font-size: 16px;
   font-weight: 850;
 }
-
 .mode-card span {
   color: #c7defe;
   font-size: 12px;
 }
-
-/* 5. PAINÉIS PRINCIPAIS */
 
 .settings-panel,
 .question-card,
 .timer-panel {
   margin-top: 24px;
   padding: 24px;
-
   border: 1px solid rgba(76, 164, 255, 0.43);
   border-radius: 22px;
-
   background: linear-gradient(145deg, rgba(12, 34, 77, 0.94), rgba(6, 16, 43, 0.94));
-
   box-shadow:
     0 18px 45px rgba(0, 0, 0, 0.3),
     inset 0 1px 0 rgba(255, 255, 255, 0.07);
-
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
 }
@@ -1415,29 +2068,22 @@ onBeforeUnmount(() => {
   border-color: rgba(110, 130, 255, 0.4);
 }
 
-/* 6. CAMPOS DO QUASAR */
-
 :deep(.q-field--outlined .q-field__control) {
   border-radius: 12px;
   background: rgba(4, 14, 37, 0.78);
 }
-
 :deep(.q-field--outlined .q-field__control:before) {
   border-color: rgba(111, 182, 255, 0.55);
 }
-
 :deep(.q-field--outlined:hover .q-field__control:before) {
   border-color: #59bbff;
 }
-
 :deep(.q-field--outlined .q-field__control:after) {
   border-color: #ffd34f;
 }
-
 :deep(.q-field__label) {
   color: #9bcfff;
 }
-
 :deep(.q-field__native),
 :deep(.q-field__input),
 :deep(.q-field__marginal),
@@ -1445,29 +2091,22 @@ onBeforeUnmount(() => {
 :deep(.q-field__suffix) {
   color: #fff;
 }
-
 :deep(.q-field--outlined.q-field--focused .q-field__control) {
   box-shadow: 0 0 0 3px rgba(58, 164, 255, 0.12);
 }
-
-/* 7. BOTÕES */
 
 .start-button {
   min-height: 54px;
   border: 1px solid rgba(255, 230, 134, 0.55);
   border-radius: 14px;
-
   background: linear-gradient(100deg, #ffb52e, #ff8325 52%, #ed5b22);
-
   color: #11172d;
   font-size: 15px;
   font-weight: 950;
   letter-spacing: 0.5px;
-
   box-shadow:
     0 8px 24px rgba(255, 119, 30, 0.24),
     inset 0 1px 0 rgba(255, 255, 255, 0.3);
-
   transition:
     transform 0.2s ease,
     filter 0.2s ease,
@@ -1477,10 +2116,8 @@ onBeforeUnmount(() => {
 .start-button:hover {
   filter: brightness(1.08);
   transform: translateY(-2px);
-
   box-shadow: 0 12px 30px rgba(255, 119, 30, 0.34);
 }
-
 .online-help,
 .note {
   color: #bad5f5;
@@ -1488,17 +2125,12 @@ onBeforeUnmount(() => {
   line-height: 1.6;
 }
 
-/* 8. SALA ONLINE */
-
 .room-code-card {
   padding: 16px;
   border: 1px solid rgba(255, 211, 79, 0.5);
   border-radius: 14px;
-
   background: linear-gradient(135deg, rgba(18, 62, 120, 0.95), rgba(11, 24, 63, 0.95));
-
   text-align: center;
-
   box-shadow: 0 0 24px rgba(20, 137, 255, 0.13);
 }
 
@@ -1509,7 +2141,6 @@ onBeforeUnmount(() => {
   letter-spacing: 8px;
   text-shadow: 0 0 18px rgba(255, 190, 35, 0.22);
 }
-
 .room-player {
   padding: 7px;
   margin-top: 6px;
@@ -1519,46 +2150,35 @@ onBeforeUnmount(() => {
   color: #eee;
 }
 
-/* 9. EQUIPAS */
-
 .teams-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
-
 .teams-grid > div {
   padding: 14px;
   border-radius: 15px;
 }
-
 .teams-grid > div strong {
   display: block;
   margin-bottom: 8px;
 }
-
 .teams-grid .team-a,
 .team-a {
   border: 1px solid rgba(71, 151, 255, 0.8);
   border-radius: 15px;
-
   background: linear-gradient(135deg, rgba(17, 69, 139, 0.92), rgba(10, 31, 75, 0.94));
 }
-
 .teams-grid .team-b,
 .team-b {
   border: 1px solid rgba(255, 171, 55, 0.8);
   border-radius: 15px;
-
   background: linear-gradient(135deg, rgba(126, 63, 21, 0.7), rgba(53, 32, 30, 0.93));
 }
-
-/* 10. ECRÃ DE JOGO E CRONÓMETRO */
 
 .playing-screen {
   padding-top: 8px;
 }
-
 .game-topline {
   display: flex;
   justify-content: space-between;
@@ -1569,14 +2189,11 @@ onBeforeUnmount(() => {
 .timer-panel {
   text-align: center;
   border-color: rgba(255, 211, 79, 0.48);
-
   background: linear-gradient(145deg, rgba(15, 41, 88, 0.96), rgba(7, 16, 43, 0.96));
 }
-
 .timer-caption {
   margin-bottom: 8px;
 }
-
 .timer-value {
   margin-bottom: 14px;
   color: #ffd34f;
@@ -1586,80 +2203,63 @@ onBeforeUnmount(() => {
   letter-spacing: 2px;
   text-shadow: 0 0 30px rgba(255, 176, 33, 0.23);
 }
-
 .timer-panel.urgent .timer-value {
   color: #ff665d;
   text-shadow: 0 0 24px rgba(255, 72, 72, 0.3);
 }
-
-/* 11. CARTÕES DE JOGADORES */
 
 .players-row {
   justify-content: space-between;
   gap: 10px;
   margin-top: 22px;
 }
-
 .player-card {
   flex: 1;
   gap: 10px;
   min-width: 0;
   padding: 12px;
-
   border: 1px solid rgba(73, 155, 255, 0.42);
   border-radius: 15px;
-
   background: linear-gradient(135deg, rgba(13, 42, 87, 0.95), rgba(7, 21, 51, 0.95));
 }
-
 .player-info {
   display: flex;
   flex-direction: column;
   gap: 5px;
   min-width: 0;
 }
-
 .player-info strong {
   overflow-wrap: anywhere;
   color: #fff;
   font-size: 13px;
 }
-
 .player-info span {
   color: #b7d9ff;
 }
-
 .versus {
   color: #ffd34f;
   font-weight: 900;
 }
-
 .score-teams {
   margin-top: 20px;
 }
-
 .team-card {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
-
 .team-card strong {
   font-size: 18px;
 }
-
 .team-card span {
   color: #ffd34f;
   font-size: 24px;
   font-weight: 900;
 }
-
 .team-card small {
   overflow-wrap: anywhere;
   color: #c4d8f7;
 }
-
-/* 12. PERGUNTAS */
 
 .question-meta {
   justify-content: space-between;
@@ -1668,7 +2268,6 @@ onBeforeUnmount(() => {
   color: #b7d9ff;
   font-size: 13px;
 }
-
 .question-card h2 {
   margin: 0 0 22px;
   color: #fff;
@@ -1676,9 +2275,6 @@ onBeforeUnmount(() => {
   font-weight: 800;
   line-height: 1.35;
 }
-
-/* 13. RESPOSTAS */
-
 .answers-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1689,19 +2285,14 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-
   min-height: 64px;
   padding: 14px;
-
   border: 1px solid rgba(75, 157, 255, 0.5);
   border-radius: 14px;
-
   background: linear-gradient(135deg, rgba(17, 55, 113, 0.94), rgba(10, 27, 64, 0.94));
-
   color: #fff;
   text-align: left;
   cursor: pointer;
-
   transition:
     border-color 0.2s ease,
     background 0.2s ease,
@@ -1711,40 +2302,31 @@ onBeforeUnmount(() => {
 
 .answer-button:hover:not(:disabled) {
   border-color: #ffd34f;
-
   background: linear-gradient(135deg, rgba(27, 86, 159, 0.97), rgba(15, 43, 94, 0.97));
-
   box-shadow: 0 0 18px rgba(43, 145, 255, 0.2);
   transform: translateY(-2px);
 }
-
 .answer-button:disabled {
   opacity: 0.7;
   cursor: not-allowed;
 }
-
 .answer-letter {
   display: grid;
   place-items: center;
   flex-shrink: 0;
   width: 30px;
   height: 30px;
-
   border: 1px solid rgba(255, 211, 79, 0.45);
   border-radius: 8px;
-
   background: linear-gradient(135deg, #ffd34f, #ff922b);
   color: #111a36;
   font-weight: 900;
 }
-
 .answer-feedback {
   margin-top: 16px;
   color: #ffd34f;
   font-weight: 700;
 }
-
-/* 14. ACÇÕES INFERIORES */
 
 .bottom-actions {
   justify-content: space-between;
@@ -1754,49 +2336,37 @@ onBeforeUnmount(() => {
   color: #bad5f5;
   font-size: 12px;
 }
-
-/* 15. ECRÃ DE RESULTADOS */
-
 .result-screen {
   padding: 45px 0;
   text-align: center;
 }
-
 .result-screen h1 {
   font-size: clamp(30px, 5vw, 48px);
 }
-
 .result-score-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   margin-top: 28px;
 }
-
 .result-score {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 20px;
-
   border: 1px solid rgba(80, 163, 255, 0.43);
   border-radius: 18px;
-
   background: linear-gradient(140deg, rgba(17, 47, 99, 0.94), rgba(8, 20, 49, 0.94));
 }
-
 .result-score strong {
   color: #ffd34f;
   font-size: 36px;
   text-shadow: 0 0 20px rgba(255, 185, 44, 0.18);
 }
-
 .result-score span,
 .result-score small {
   color: #c4d8f7;
 }
-
-/* 16. RODAPÉ */
 
 .game-footer {
   display: flex;
@@ -1804,15 +2374,11 @@ onBeforeUnmount(() => {
   gap: 10px;
   margin-top: 45px;
   padding: 20px 0;
-
   border-top: 1px solid rgba(96, 164, 255, 0.25);
-
   color: #a9c9f4;
   font-size: 10px;
   letter-spacing: 1.5px;
 }
-
-/* 17. ACESSIBILIDADE E INTERACÇÕES */
 
 .mode-card:focus-visible,
 .answer-button:focus-visible,
@@ -1829,90 +2395,70 @@ onBeforeUnmount(() => {
   }
 }
 
-/* 18. ADAPTAÇÃO PARA TELEMÓVEIS */
-
 @media (max-width: 650px) {
   .game-shell {
     padding: 0 12px;
   }
-
   .game-header {
     padding: 14px 0 20px;
   }
-
   .brand {
     gap: 10px;
   }
-
   .brand-icon {
     width: 48px;
     height: 48px;
     border-radius: 14px;
   }
-
   .brand-name {
     font-size: 17px;
   }
-
   .hero {
     padding: 20px 0 26px;
   }
-
   .mode-grid {
     grid-template-columns: 1fr;
     gap: 12px;
   }
-
   .mode-card {
     min-height: 110px;
     padding: 17px;
   }
-
   .settings-panel,
   .question-card,
   .timer-panel {
     padding: 16px;
     border-radius: 17px;
   }
-
   .answers-grid {
     grid-template-columns: 1fr;
   }
-
   .players-row {
     align-items: stretch;
   }
-
   .player-card {
     flex-direction: column;
     align-items: flex-start;
   }
-
   .player-info strong {
     font-size: 11px;
   }
-
   .timer-value {
     font-size: 44px;
   }
-
   .room-code {
     font-size: 28px;
     letter-spacing: 5px;
   }
-
   .teams-grid {
     gap: 8px;
   }
-
   .teams-grid > div {
     padding: 10px;
   }
-
   .team-card span {
     font-size: 19px;
   }
-
   .game-footer {
     flex-direction: column;
     align-items: center;
