@@ -1,3 +1,4 @@
+  // Actualização de publicação Cloudflare Pages
 export const boardCategories = [
   'MZ Challenge',
   'História Nacional',
