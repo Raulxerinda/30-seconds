@@ -36,3 +36,5 @@ export const boardCategories = [
   'Arts & Culture',
   'Puzzle Zone',
 ]
+
+// Nova publicação após restaurar a ligação ao GitHub.
